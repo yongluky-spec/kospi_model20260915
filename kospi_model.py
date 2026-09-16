@@ -49,13 +49,13 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
-
 DEFAULTS = {
     "KOSPI 현물": "^KS11",
     "KOSPI200 현물": "069500.KS",  # KODEX 200 ETF. 야후에서 안정적으로 일봉 이력 제공
     "KOSPI200 선물": "",  # 무료 데이터로는 신뢰할 수 있는 한국 선물 데이터가 없어 기본은 빈칸
     "USD/KRW": "KRW=X",
     "VIX": "^VIX",
+    "미국장 프록시": "^IXIC",
 }
 
 # ---- 신뢰도 보정 임계값 (필요시 조정) ----
@@ -183,6 +183,42 @@ def log_prediction_and_compare(record, path=PREDICTION_LOG_PATH):
         pass
 
     return comparison
+
+
+def prediction_history_rows(records):
+    """예측 로그를 신뢰도 추이와 사후 방향 적중률 표로 변환한다."""
+    rows = []
+    ordered = sorted(records, key=lambda item: item.get("prediction_date", ""))
+    for index, record in enumerate(ordered):
+        row = {
+            "예측일": record.get("prediction_date", "-"),
+            "방향 점수": record.get("direction_score", np.nan),
+            "신뢰도(%)": record.get("confidence", np.nan),
+            "국면": record.get("regime", "-") ,
+            "예측 방향": record.get("predicted_direction", "보합"),
+            "헤지 단계(%)": record.get("current_position", np.nan),
+            "실제 방향": "미확인",
+            "방향 적중": "미확인",
+        }
+        if index + 1 < len(ordered):
+            next_record = ordered[index + 1]
+            try:
+                actual_return_pct = (
+                    float(next_record["spot_close"]) / float(record["spot_close"]) - 1.0
+                ) * 100
+                actual_direction = (
+                    "상승" if actual_return_pct > 0 else
+                    "하락" if actual_return_pct < 0 else "보합"
+                )
+                row["실제 방향"] = actual_direction
+                row["방향 적중"] = (
+                    "적중" if record.get("predicted_direction", "보합") == actual_direction
+                    else "불일치"
+                )
+            except (KeyError, TypeError, ValueError, ZeroDivisionError):
+                pass
+        rows.append(row)
+    return rows
 
 
 @st.cache_data(ttl=300)
@@ -332,6 +368,459 @@ def volatility_ratio(df, short_n=5, long_n=60):
     if not std_long or np.isnan(std_long) or std_long == 0:
         return np.nan
     return float(std_short / std_long)
+
+
+def energy_levels(df, volume_window=20, momentum_window=5):
+    """ATR·거래량·5일 모멘텀으로 현재 에너지 상단/하단을 계산한다."""
+    if len(df) < max(volume_window, momentum_window, 14) + 1:
+        return None
+
+    current = float(df["Close"].iloc[-1])
+    atr_value = float(atr(df, n=14).iloc[-1])
+    momentum_return = float(df["Close"].pct_change(momentum_window).iloc[-1])
+    if np.isnan(atr_value) or np.isnan(momentum_return):
+        return None
+
+    volume_available = "Volume" in df.columns and not df["Volume"].isna().all()
+    if volume_available:
+        average_volume = df["Volume"].rolling(volume_window).mean().iloc[-1]
+        actual_volume = df["Volume"].iloc[-1]
+        volume_ratio_value = (
+            float(actual_volume / average_volume)
+            if average_volume and not np.isnan(average_volume) else 1.0
+        )
+    else:
+        volume_ratio_value = 1.0
+
+    volume_ratio_value = max(volume_ratio_value, 0.0)
+    momentum_factor = float(np.clip(1.0 - abs(momentum_return), 0.0, 1.0))
+    energy_width = atr_value * volume_ratio_value * momentum_factor
+    return {
+        "current": current,
+        "atr14": atr_value,
+        "momentum_return_5d": momentum_return,
+        "momentum_factor": momentum_factor,
+        "volume_ratio": volume_ratio_value,
+        "volume_available": volume_available,
+        "energy_width": energy_width,
+        "dynamic_resistance": current + energy_width,
+        "dynamic_support": current - energy_width,
+    }
+
+
+def energy_level_backtest(df, horizon=5, volume_window=20, momentum_window=5):
+    """과거 에너지 상·하단의 터치와 이후 방어/거부 여부를 검증한다."""
+    required = {"High", "Low", "Close"}
+    minimum = max(14, volume_window, momentum_window) + horizon + 1
+    if not required.issubset(df.columns) or len(df) < minimum:
+        return {"resistance": None, "support": None, "sample_count": 0}
+
+    events = []
+    for index in range(max(14, volume_window, momentum_window), len(df) - horizon):
+        window = df.iloc[:index + 1]
+        levels = energy_levels(window, volume_window, momentum_window)
+        if levels is None or levels["energy_width"] <= 0:
+            continue
+        future = df.iloc[index + 1:index + horizon + 1]
+        resistance_touch = bool((future["High"] >= levels["dynamic_resistance"]).any())
+        support_touch = bool((future["Low"] <= levels["dynamic_support"]).any())
+        events.append({
+            "resistance_touch": resistance_touch,
+            "resistance_hold": resistance_touch and float(future["Close"].iloc[-1]) < levels["dynamic_resistance"],
+            "support_touch": support_touch,
+            "support_hold": support_touch and float(future["Close"].iloc[-1]) > levels["dynamic_support"],
+        })
+
+    def summarize(touch_key, hold_key):
+        touched = [event for event in events if event[touch_key]]
+        if not touched:
+            return {"touch_count": 0, "hold_count": 0, "hold_probability": np.nan, "ci_lower": np.nan, "ci_upper": np.nan}
+        hold_count = sum(event[hold_key] for event in touched)
+        lower, upper = _wilson_interval(hold_count, len(touched))
+        return {
+            "touch_count": len(touched),
+            "hold_count": hold_count,
+            "hold_probability": hold_count / len(touched) * 100,
+            "ci_lower": lower,
+            "ci_upper": upper,
+        }
+
+    return {
+        "resistance": summarize("resistance_touch", "resistance_hold"),
+        "support": summarize("support_touch", "support_hold"),
+        "sample_count": len(events),
+        "horizon": horizon,
+    }
+
+
+def overnight_gap_stats(df, threshold_pct=1.0):
+    """종가 대비 다음 거래일 시가 갭의 실제 과거 분포를 계산한다."""
+    required = {"Open", "Close"}
+    if not required.issubset(df.columns) or len(df) < 2:
+        return None
+
+    gaps = (df["Open"].shift(-1) / df["Close"] - 1.0) * 100
+    gaps = gaps.replace([np.inf, -np.inf], np.nan).dropna()
+    if gaps.empty:
+        return None
+
+    absolute_gaps = gaps.abs()
+    return {
+        "count": int(gaps.size),
+        "mean": float(gaps.mean()),
+        "median": float(gaps.median()),
+        "std": float(gaps.std(ddof=1)) if len(gaps) > 1 else 0.0,
+        "p10": float(gaps.quantile(0.10)),
+        "p90": float(gaps.quantile(0.90)),
+        "mean_abs": float(absolute_gaps.mean()),
+        "p90_abs": float(absolute_gaps.quantile(0.90)),
+        "up_probability": float((gaps > 0).mean() * 100),
+        "down_probability": float((gaps < 0).mean() * 100),
+        "large_gap_probability": float((absolute_gaps >= threshold_pct).mean() * 100),
+        "latest_gap": float(gaps.iloc[-1]) if len(gaps) else np.nan,
+    }
+
+
+def conditional_overnight_gap_stats(kospi_df, global_df, threshold_pct=1.0):
+    """직전 미국장 수익률 조건별로 다음 KOSPI 시가 갭을 비교한다."""
+    required = {"Open", "Close"}
+    if not required.issubset(kospi_df.columns) or "Close" not in global_df.columns:
+        return None
+    if len(kospi_df) < 2 or len(global_df) < 2:
+        return None
+
+    kospi_index = pd.DatetimeIndex(pd.to_datetime(kospi_df.index)).tz_localize(None)
+    global_index = pd.DatetimeIndex(pd.to_datetime(global_df.index)).tz_localize(None)
+    kospi = kospi_df.copy()
+    global_returns = global_df["Close"].pct_change() * 100
+    global_returns.index = global_index
+    kospi.index = kospi_index
+
+    gap_frame = pd.DataFrame({
+        "event_date": kospi.index[:-1],
+        "next_date": kospi.index[1:],
+        "gap": (kospi["Open"].iloc[1:].to_numpy() / kospi["Close"].iloc[:-1].to_numpy() - 1.0) * 100,
+    })
+    gap_frame["us_lookup_date"] = gap_frame["next_date"] - pd.Timedelta(days=1)
+    us_frame = global_returns.rename("us_return").reset_index()
+    us_frame.columns = ["us_date", "us_return"]
+    us_frame = us_frame.dropna().sort_values("us_date")
+    gap_frame = pd.merge_asof(
+        gap_frame.sort_values("us_lookup_date"),
+        us_frame,
+        left_on="us_lookup_date",
+        right_on="us_date",
+        direction="backward",
+        tolerance=pd.Timedelta(days=4),
+    ).dropna(subset=["us_return", "gap"])
+    if gap_frame.empty:
+        return None
+
+    gap_frame["condition"] = np.select(
+        [gap_frame["us_return"] >= 0.5, gap_frame["us_return"] <= -0.5],
+        ["미국장 상승", "미국장 하락"],
+        default="미국장 혼조",
+    )
+    rows = []
+    for condition, group in gap_frame.groupby("condition", sort=False):
+        absolute_gaps = group["gap"].abs()
+        lower, upper = _wilson_interval(int((group["gap"] > 0).sum()), len(group))
+        rows.append({
+            "condition": condition,
+            "count": int(len(group)),
+            "up_probability": float((group["gap"] > 0).mean() * 100),
+            "down_probability": float((group["gap"] < 0).mean() * 100),
+            "large_gap_probability": float((absolute_gaps >= threshold_pct).mean() * 100),
+            "mean_abs": float(absolute_gaps.mean()),
+            "ci_lower": lower,
+            "ci_upper": upper,
+        })
+
+    latest_us_return = float(global_returns.iloc[-1]) if not global_returns.empty else np.nan
+    return {
+        "rows": rows,
+        "sample_count": int(len(gap_frame)),
+        "latest_us_return": latest_us_return,
+        "latest_condition": (
+            "미국장 상승" if latest_us_return >= 0.5 else
+            "미국장 하락" if latest_us_return <= -0.5 else "미국장 혼조"
+        ) if not np.isnan(latest_us_return) else "데이터 없음",
+    }
+
+
+def overnight_action_plan(level, overnight_stats, conditional_stats, rebound_analysis, volume_ratio_value):
+    """갭 노출·반등 형태·거래량을 결합해 다음 거래일 실행안을 만든다."""
+    if overnight_stats is None:
+        return {"level": level, "action": "데이터 부족", "confidence": 0, "reasons": []}
+
+    reasons = []
+    risk_score = 0
+    if overnight_stats["large_gap_probability"] >= 50:
+        risk_score += 2
+        reasons.append(f"±1% 이상 갭 과거 빈도 {overnight_stats['large_gap_probability']:.1f}%")
+    elif overnight_stats["large_gap_probability"] >= 30:
+        risk_score += 1
+
+    if not np.isnan(volume_ratio_value) and volume_ratio_value < 0.8:
+        risk_score += 1
+        reasons.append(f"거래량 {volume_ratio_value:.2f}배로 반등 확인 부족")
+
+    if rebound_analysis.get("current"):
+        current = rebound_analysis["current"]
+        if current["is_rebound"] and not current["support_touch"]:
+            risk_score += 1
+            reasons.append("반등은 발생했지만 주요 지지선 확인이 약함")
+
+    current_condition = conditional_stats.get("latest_condition") if conditional_stats else None
+    conditional_row = next(
+        (row for row in (conditional_stats or {}).get("rows", []) if row["condition"] == current_condition),
+        None,
+    )
+    if conditional_row and conditional_row["large_gap_probability"] >= 50:
+        risk_score += 1
+        reasons.append(f"현재 미국장 조건의 큰 갭 빈도 {conditional_row['large_gap_probability']:.1f}%")
+
+    if risk_score >= 3:
+        action = "장 마감 전 50% 축소 · 내일 시가와 첫 15분 수급 확인 후 재진입"
+        recommended_level = round(level * 0.5 / 25) * 25
+    elif risk_score >= 1:
+        action = "오버나이트 75%만 유지 · 갭 발생 시 추가 진입은 보류"
+        recommended_level = round(level * 0.75 / 25) * 25
+    else:
+        action = "현재 헤지 수준 유지 · 단, 시가 갭 손실 한도 사전 설정"
+        recommended_level = level
+
+    return {
+        "level": int(recommended_level),
+        "action": action,
+        "confidence": int(max(0, min(100, 100 - risk_score * 20))),
+        "risk_score": risk_score,
+        "reasons": reasons,
+        "conditional_row": conditional_row,
+    }
+
+
+def _cluster_pivot_levels(levels, tolerance):
+    """가격 허용오차 안에 있는 스윙 포인트를 하나의 반응 클러스터로 묶는다."""
+    if not levels:
+        return []
+
+    clusters = []
+    for level, date in sorted(levels, key=lambda item: item[0]):
+        matching = [
+            cluster for cluster in clusters
+            if abs(level - cluster["level"]) <= tolerance
+        ]
+        if matching:
+            cluster = min(matching, key=lambda item: abs(level - item["level"]))
+            cluster["prices"].append(level)
+            cluster["dates"].append(date)
+            cluster["level"] = float(np.mean(cluster["prices"]))
+        else:
+            clusters.append({"level": float(level), "prices": [level], "dates": [date]})
+
+    return [
+        {
+            "level": cluster["level"],
+            "reactions": len(cluster["prices"]),
+            "last_reaction": max(cluster["dates"]),
+        }
+        for cluster in clusters
+    ]
+
+
+def swing_level_clusters(df, lookback=5, min_reactions=2):
+    """스윙 고점·저점을 ATR 기반 허용오차로 묶어 지지·저항 클러스터를 찾는다."""
+    required = {"High", "Low", "Close"}
+    if not required.issubset(df.columns) or len(df) < lookback * 2 + 1:
+        return {"support": [], "resistance": [], "tolerance": np.nan}
+
+    atr_value = float(atr(df).iloc[-1])
+    close = float(df["Close"].iloc[-1])
+    if np.isnan(atr_value) or atr_value <= 0:
+        atr_value = close * 0.005
+    tolerance = max(atr_value * 0.5, close * 0.0025)
+
+    highs = []
+    lows = []
+    for index in range(lookback, len(df) - lookback):
+        high_window = df["High"].iloc[index - lookback:index + lookback + 1]
+        low_window = df["Low"].iloc[index - lookback:index + lookback + 1]
+        date = df.index[index].date().isoformat()
+        if df["High"].iloc[index] == high_window.max():
+            highs.append((float(df["High"].iloc[index]), date))
+        if df["Low"].iloc[index] == low_window.min():
+            lows.append((float(df["Low"].iloc[index]), date))
+
+    support = [
+        cluster for cluster in _cluster_pivot_levels(lows, tolerance)
+        if cluster["level"] <= close and cluster["reactions"] >= min_reactions
+    ]
+    resistance = [
+        cluster for cluster in _cluster_pivot_levels(highs, tolerance)
+        if cluster["level"] >= close and cluster["reactions"] >= min_reactions
+    ]
+    support.sort(key=lambda item: item["level"], reverse=True)
+    resistance.sort(key=lambda item: item["level"])
+
+    return {
+        "support": support,
+        "resistance": resistance,
+        "tolerance": float(tolerance),
+        "lookback": lookback,
+        "close": close,
+    }
+
+
+def rebound_exit_guide(spot, swing_levels, energy_level, resistance_level, volume_ratio_value, direction_score):
+    """반등 시 저항 목표와 30/40/30 분할 청산 기준을 계산한다."""
+    resistance_clusters = swing_levels.get("resistance", [])
+    nearest_cluster = next(
+        (item for item in resistance_clusters if item["level"] > spot),
+        None,
+    )
+    candidates = []
+    if nearest_cluster is not None:
+        candidates.append((float(nearest_cluster["level"]), "스윙 저항 클러스터"))
+    if energy_level is not None and energy_level["dynamic_resistance"] > spot:
+        candidates.append((float(energy_level["dynamic_resistance"]), "동적 저항선"))
+    if not candidates:
+        return None
+
+    first_target, target_source = min(candidates, key=lambda item: item[0])
+    distance_pct = (first_target / spot - 1.0) * 100
+    tolerance = swing_levels.get("tolerance", 0.0)
+    target_zone_low = max(spot, first_target - tolerance)
+    target_zone_high = first_target + tolerance
+    breakout_confirmed = (
+        first_target > spot
+        and not np.isnan(volume_ratio_value)
+        and volume_ratio_value >= VOLUME_RATIO_STRONG
+    )
+    trend_holds = direction_score < -45
+    return {
+        "first_target": first_target,
+        "target_source": target_source,
+        "distance_pct": distance_pct,
+        "target_zone_low": target_zone_low,
+        "target_zone_high": target_zone_high,
+        "tolerance": tolerance,
+        "breakout_confirmed": breakout_confirmed,
+        "trend_holds": trend_holds,
+        "stage_1_pct": 30,
+        "stage_2_pct": 40,
+        "stage_3_pct": 30,
+    }
+
+
+def _wilson_interval(successes, total, z=1.96):
+    """이항 비율의 표본 크기 보정 95% Wilson 신뢰구간을 반환한다."""
+    if total <= 0:
+        return np.nan, np.nan
+    proportion = successes / total
+    denominator = 1 + z ** 2 / total
+    center = (proportion + z ** 2 / (2 * total)) / denominator
+    margin = (
+        z / denominator
+        * np.sqrt(proportion * (1 - proportion) / total + z ** 2 / (4 * total ** 2))
+    )
+    return (center - margin) * 100, (center + margin) * 100
+
+
+def rebound_scenario_analysis(df, support_levels=None, horizon=5):
+    """과거 반등 사례를 이용해 기술적 반등과 추세 전환 시나리오를 검증한다."""
+    result = {
+        "current": None,
+        "scenarios": [],
+        "sample_count": 0,
+        "sample_label": "표본 부족",
+        "dominant": None,
+    }
+    if not {"High", "Low", "Close"}.issubset(df.columns) or len(df) < 80 + horizon:
+        return result
+
+    close = df["Close"]
+    atr_series = atr(df)
+    ma20 = close.rolling(20).mean()
+    rolling_low = df["Low"].rolling(60).min()
+    returns_1d = close.pct_change() * 100
+    returns_5d = close.pct_change(5) * 100
+
+    historical_events = []
+    for index in range(60, len(df) - horizon):
+        event_close = float(close.iloc[index])
+        event_atr = float(atr_series.iloc[index])
+        if np.isnan(event_atr) or event_atr <= 0:
+            continue
+        is_rebound = returns_1d.iloc[index] >= 1.0 and returns_5d.iloc[index] <= -2.0
+        support_touch = event_close <= rolling_low.iloc[index] + 1.5 * event_atr
+        if not is_rebound:
+            continue
+
+        future_return = (close.iloc[index + horizon] / event_close - 1.0) * 100
+        if future_return >= 2.0:
+            label = "국면 전환"
+        elif future_return <= -1.0:
+            label = "기술적 반등 실패"
+        else:
+            label = "추세 진행 중"
+        historical_events.append({"label": label, "support_touch": support_touch})
+
+    support_events = [event for event in historical_events if event["support_touch"]]
+    events = support_events if len(support_events) >= 10 else historical_events
+    if not events:
+        return result
+
+    labels = ["기술적 반등 실패", "국면 전환", "추세 진행 중"]
+    scenario_rows = []
+    for label in labels:
+        successes = sum(event["label"] == label for event in events)
+        lower, upper = _wilson_interval(successes, len(events))
+        scenario_rows.append({
+            "scenario": label,
+            "count": successes,
+            "probability": successes / len(events) * 100,
+            "lower": lower,
+            "upper": upper,
+        })
+    scenario_rows.sort(key=lambda row: row["probability"], reverse=True)
+
+    current_close = float(close.iloc[-1])
+    current_atr = float(atr_series.iloc[-1])
+    current_support = np.nan
+    if support_levels:
+        current_support = float(support_levels[0]["level"])
+    elif not np.isnan(current_atr):
+        current_support = float(rolling_low.iloc[-1])
+    support_distance = (
+        abs(current_close - current_support) / current_atr
+        if not np.isnan(current_support) and current_atr > 0 else np.nan
+    )
+    current = {
+        "today_return": float(returns_1d.iloc[-1]),
+        "return_5d": float(returns_5d.iloc[-1]),
+        "support": current_support,
+        "support_distance_atr": support_distance,
+        "is_rebound": bool(returns_1d.iloc[-1] >= 1.0 and returns_5d.iloc[-1] <= -2.0),
+        "support_touch": bool(not np.isnan(support_distance) and support_distance <= 1.5),
+        "ma20": float(ma20.iloc[-1]),
+    }
+    current["setup_score"] = round(
+        100 * (
+            (1 / 3 if current["is_rebound"] else 0)
+            + (1 / 3 if current["support_touch"] else 0)
+            + (1 / 3 if current_close > current["ma20"] else 0)
+        )
+    )
+
+    result.update({
+        "current": current,
+        "scenarios": scenario_rows,
+        "sample_count": len(events),
+        "sample_label": "지지선 접촉 사례" if events is support_events else "전체 반등 사례",
+        "dominant": scenario_rows[0],
+    })
+    return result
 
 
 def weekly_ma20(df, ma_n=20):
@@ -499,6 +988,19 @@ def fit_gjr_garch(kospi_df, min_obs=100):
     return res, today_vol, vol_path
 
 
+def ewma_volatility_path(kospi_df, horizon=BELLMAN_HORIZON, decay=0.94):
+    """arch 대체용 EWMA 일간 변동성(%)과 향후 경로를 반환한다."""
+    returns = 100 * np.log(kospi_df["Close"] / kospi_df["Close"].shift(1)).dropna()
+    if len(returns) < 20:
+        return np.nan, None
+
+    variance = float(returns.iloc[:20].var())
+    for value in returns.iloc[20:]:
+        variance = decay * variance + (1.0 - decay) * float(value) ** 2
+    today_vol = float(np.sqrt(max(variance, 0.0)))
+    return today_vol, np.full(horizon, today_vol, dtype=float)
+
+
 def extended_garch_variance(garch_today_vol_pct, vol_ratio_val, basis_z_val, delta1=0.3, delta2=0.2):
     """
     확장형 조건부분산 h_t_ext = h_t * (1 + δ1·X1 + δ2·X2) 근사.
@@ -576,6 +1078,7 @@ def dynamic_band_forecast(
     atr_value,
     gamma,
     last_return,
+    taylor_error_multiplier=1.0,
     horizon=BELLMAN_HORIZON,
 ):
     """테일러 중심값과 GJR-GARCH 변동성으로 h일 동적 밴드를 계산한다."""
@@ -588,7 +1091,10 @@ def dynamic_band_forecast(
     for index, volatility_pct in enumerate(volatility_path_pct[:horizon]):
         taylor_row = taylor_rows[index] if index < len(taylor_rows) else None
         center = taylor_row["proj"] if taylor_row is not None else spot
-        taylor_error = taylor_row["upper"] - center if taylor_row is not None else 0.0
+        taylor_error = (
+            (taylor_row["upper"] - center) * taylor_error_multiplier
+            if taylor_row is not None else 0.0
+        )
         garch_width = spot * float(volatility_pct) / 100.0
         base_width = max(garch_width, atr_value if not np.isnan(atr_value) else 0.0)
         lower_multiplier = 1.0 + gamma_eff if negative_shock else 1.0
@@ -738,6 +1244,33 @@ def position_level(score, confidence, basis_z=0.0):
     return 0
 
 
+def basis_filtered_score(score, basis_z, volume_ratio_value, volatility_ratio_value):
+    """Basis 극단 구간에서 현물 방향 점수의 신뢰도만 보수적으로 할인한다."""
+    if np.isnan(basis_z):
+        return float(score), 1.0
+    if abs(basis_z) >= 2.0:
+        discount = 0.55 if (
+            np.isnan(volume_ratio_value)
+            or volume_ratio_value < 1.0
+            or (not np.isnan(volatility_ratio_value) and volatility_ratio_value > VOLATILITY_RATIO_HOT)
+        ) else 0.70
+    elif abs(basis_z) >= 1.5:
+        discount = 0.85
+    else:
+        discount = 1.0
+    return float(score * discount), discount
+
+
+def stabilize_mixed_level(proposed_level, score, records):
+    """혼조 구간에서 25%p 단위의 잦은 레벨 전환을 완화한다."""
+    if not records or abs(score) >= 30:
+        return proposed_level
+    previous = records[-1].get("current_position")
+    if previous not in {0, 25, 50} or abs(int(previous) - proposed_level) != 25:
+        return proposed_level
+    return int(previous)
+
+
 def regime_text(score, confidence):
     if confidence < 25:
         return "신호 약함"
@@ -810,6 +1343,7 @@ st.sidebar.divider()
 st.sidebar.caption("매크로 게이트용 데이터")
 krw_ticker = st.sidebar.text_input("USD/KRW 환율", DEFAULTS["USD/KRW"])
 vix_ticker = st.sidebar.text_input("VIX 지수", DEFAULTS["VIX"])
+global_ticker = st.sidebar.text_input("미국장 프록시 (나스닥 종합)", DEFAULTS["미국장 프록시"])
 
 st.sidebar.divider()
 st.sidebar.caption("벨만 최적화(다단계 포지션 계획) 파라미터")
@@ -844,6 +1378,7 @@ ks200 = load_data(ks200_ticker, period)
 futures = load_data(futures_ticker, period)
 krw = load_data(krw_ticker, period)
 vix = load_data(vix_ticker, period)
+global_market = load_data(global_ticker, period)
 
 st.title("📊 KOSPI Market Decision Engine")
 st.caption(
@@ -861,6 +1396,12 @@ if kospi.empty:
 # ---------------- Main model ----------------
 # 모든 계산(방향 점수/신뢰도/지지·저항 밴드/차트)은 코스피 종합지수(kospi_ticker, 기본 ^KS11) 기준.
 spot_levels = make_levels(kospi)
+overnight_stats = overnight_gap_stats(kospi)
+energy_level = energy_levels(kospi)
+energy_backtest = energy_level_backtest(kospi)
+conditional_gap_stats = conditional_overnight_gap_stats(kospi, global_market)
+swing_levels = swing_level_clusters(kospi)
+rebound_analysis = rebound_scenario_analysis(kospi, swing_levels["support"])
 spot_score, spot_conf, spot_direction = directional_score(kospi)
 spot = spot_levels["close"]
 
@@ -888,28 +1429,49 @@ if not np.isnan(future) and not np.isnan(ks200_price) and ks200_price != 0:
         if not basis_z_series.empty:
             basis_z = float(basis_z_series.iloc[-1])
 
-# 방향 점수/신뢰도는 항상 코스피 종합지수만으로 계산한다.
-# KOSPI200/선물 데이터는 있어도 점수 계산에는 반영하지 않고, 화면에는 참고용으로만 표시한다.
-composite_score = spot_score
-composite_conf = spot_conf
-
-regime = regime_text(composite_score, composite_conf)
-level = position_level(composite_score, composite_conf, basis_z)
-
 # ---- 신뢰도 보정 지표 (거래량 / 변동성 / 주봉 교차 / 매크로) ----
 vol_ratio_val = volume_ratio(kospi, n=20)
 vola_ratio_val = volatility_ratio(kospi, short_n=5, long_n=60)
 weekly_ma_val = weekly_ma20(kospi, ma_n=20)
 krw_5d_pct, vix_last, macro_risk, macro_multiplier = macro_gate(krw, vix)
 
+# Basis 극단도는 선물 방향을 합성하지 않고, 현물 점수의 노이즈 신뢰도만 할인한다.
+composite_score, basis_discount = basis_filtered_score(
+    spot_score, basis_z, vol_ratio_val, vola_ratio_val
+)
+composite_conf = float(np.clip(abs(composite_score), 0, 100))
+prediction_records = _read_prediction_log(PREDICTION_LOG_PATH)
+regime = regime_text(composite_score, composite_conf)
+level = position_level(composite_score, composite_conf, basis_z)
+level = stabilize_mixed_level(level, composite_score, prediction_records)
+
 # 매크로 위험 신호(원화 약세 + VIX 급등) 시 최종 진입 강도를 절반으로 낮춘다.
 level_final = round(level * macro_multiplier / 25) * 25
 divergence_guidance = market_model_divergence(
     kospi, composite_score, level_final
 )
+rebound_exit = rebound_exit_guide(
+    spot,
+    swing_levels,
+    energy_level,
+    spot_levels["resistance"],
+    vol_ratio_val,
+    composite_score,
+)
+overnight_plan = overnight_action_plan(
+    level_final,
+    overnight_stats,
+    conditional_gap_stats,
+    rebound_analysis,
+    vol_ratio_val,
+)
 
-# ---- GJR-GARCH(1,1,1) 조건부 변동성 ----
+# ---- GJR-GARCH(1,1,1) 조건부 변동성 및 EWMA fallback ----
 garch_res, garch_today_vol_pct, garch_vol_path_pct = fit_gjr_garch(kospi)
+volatility_model_source = "GJR-GARCH"
+if garch_res is None or garch_vol_path_pct is None or np.isnan(garch_today_vol_pct):
+    garch_today_vol_pct, garch_vol_path_pct = ewma_volatility_path(kospi)
+    volatility_model_source = "EWMA fallback"
 
 # ---- 확장형 조건부분산 (거래량 소진 + 괴리 극단도 외생변수 반영) ----
 h_t_raw, h_t_ext = extended_garch_variance(
@@ -944,6 +1506,31 @@ if not futures.empty:
     )
 
 st.divider()
+st.subheader("⚡ 핵심 시장 에너지 계산")
+st.latex(
+    r"R_{dynamic} = P_{current} + \left(ATR_{14} \times "
+    r"\frac{Volume_{actual}}{Volume_{avg}} \times "
+    r"\left(1 - \frac{|\Delta P_{5d}|}{P_{current}}\right)\right)"
+)
+if energy_level is None:
+    st.warning("현재 데이터가 부족해 시장 에너지 저항선을 계산하지 못했습니다.")
+else:
+    st.write(
+        f"`{energy_level['current']:,.2f} + ({energy_level['atr14']:,.2f} × "
+        f"{energy_level['volume_ratio']:.2f} × "
+        f"(1 - {abs(energy_level['momentum_return_5d']):.4f}))`"
+    )
+    energy_top = st.columns(4)
+    energy_top[0].metric("현재가 P_current", f"{energy_level['current']:,.2f}")
+    energy_top[1].metric("ATR14", f"{energy_level['atr14']:,.2f}")
+    energy_top[2].metric("거래량 배수", f"{energy_level['volume_ratio']:.2f}x")
+    energy_top[3].metric("R_dynamic 동적 저항", f"{energy_level['dynamic_resistance']:,.2f}")
+    st.caption(
+        f"최종 에너지 폭 {energy_level['energy_width']:,.2f} · "
+        f"동적 지지선 {energy_level['dynamic_support']:,.2f} · "
+        f"5일 수익률 {energy_level['momentum_return_5d'] * 100:+.2f}% · "
+        "스윙 저항선과 거래량 배수를 직접 결합하지 않음"
+    )
 
 # ---------------- Decision ----------------
 left, right = st.columns([1, 1])
@@ -977,15 +1564,308 @@ with right:
     if not np.isnan(basis):
         st.metric("Basis", f"{basis:+.3f}%")
         st.write(f"Basis Z-score: `{basis_z:+.2f}`")
+        st.write(f"현물 방향점수 할인: `{basis_discount:.0%}`")
 
         if abs(basis_z) >= 2:
-            st.error("괴리 극단: 방향 신호의 신뢰도를 할인하는 구간")
+            st.error("괴리 극단: 현물 방향점수에 강한 노이즈 할인 적용")
         elif abs(basis_z) >= 1.5:
             st.warning("괴리 확대: 추격 진입 주의")
         else:
             st.success("괴리 정상 범위")
     else:
         st.info("선물 데이터를 사용하지 않아 Basis는 계산하지 않습니다. (현물 단독 분석 모드)")
+
+# ---------------- Overnight gap risk ----------------
+st.divider()
+st.subheader("🌙 오버나이트 갭 리스크: 홀딩 vs 개장 후 재진입")
+st.caption(
+    "현재 분석 기간의 실제 KOSPI 일봉에서 '오늘 종가 → 다음 거래일 시가'를 계산했습니다. "
+    "예측 확률이 아니라 관측된 과거 분포이며, 데이터가 없는 당일 갭은 포함하지 않습니다."
+)
+
+if overnight_stats is None:
+    st.info("익일 시가를 포함한 일봉 표본이 부족해 갭 통계를 계산할 수 없습니다.")
+else:
+    gap1, gap2, gap3, gap4 = st.columns(4)
+    gap1.metric("익일 상승 갭", f"{overnight_stats['up_probability']:.1f}%")
+    gap2.metric("익일 하락 갭", f"{overnight_stats['down_probability']:.1f}%")
+    gap3.metric("절대 갭 평균", f"{overnight_stats['mean_abs']:.2f}%")
+    gap4.metric("절대 갭 90퍼센타일", f"{overnight_stats['p90_abs']:.2f}%")
+
+    gap_table = pd.DataFrame([
+        {
+            "실제 익일 갭 통계": "표본 수",
+            "값": f"{overnight_stats['count']:,}회",
+            "해석": "종가와 다음 거래일 시가가 모두 있는 관측치",
+        },
+        {
+            "실제 익일 갭 통계": "평균 / 중앙값",
+            "값": f"{overnight_stats['mean']:+.2f}% / {overnight_stats['median']:+.2f}%",
+            "해석": "갭 방향의 중심 위치",
+        },
+        {
+            "실제 익일 갭 통계": "10~90퍼센타일",
+            "값": f"{overnight_stats['p10']:+.2f}% ~ {overnight_stats['p90']:+.2f}%",
+            "해석": "관측 갭의 중앙 80% 범위",
+        },
+        {
+            "실제 익일 갭 통계": "절대 갭 1% 이상",
+            "값": f"{overnight_stats['large_gap_probability']:.1f}%",
+            "해석": "종가 홀딩 시 큰 시가 변동에 노출된 빈도",
+        },
+    ]).set_index("실제 익일 갭 통계")
+    st.dataframe(gap_table, width="stretch")
+    st.info(
+        f"이 표본에서 종가 홀딩 시 다음 시가의 평균 절대 변동은 "
+        f"{overnight_stats['mean_abs']:.2f}%이고, 1% 이상 갭은 "
+        f"{overnight_stats['large_gap_probability']:.1f}%에서 발생했습니다. "
+        "개장 후 재진입은 이 갭 노출을 줄이는 대신, 갭 이후 가격으로 진입하게 됩니다."
+    )
+
+    if conditional_gap_stats is None:
+        st.warning("나스닥 프록시와 KOSPI 날짜를 매칭할 수 없어 미국장 조건부 갭 통계는 표시하지 않습니다.")
+    else:
+        st.write(
+            f"**현재 미국장 조건:** {conditional_gap_stats['latest_condition']} · "
+            f"최근 나스닥 수익률 `{conditional_gap_stats['latest_us_return']:+.2f}%` · "
+            f"조건부 매칭 표본 `{conditional_gap_stats['sample_count']}건`"
+        )
+        conditional_table = pd.DataFrame([
+            {
+                "미국장 조건": row["condition"],
+                "표본": f"{row['count']}건",
+                "다음날 상승 갭": f"{row['up_probability']:.1f}%",
+                "다음날 하락 갭": f"{row['down_probability']:.1f}%",
+                "±1% 이상 갭": f"{row['large_gap_probability']:.1f}%",
+                "상승 갭 95% CI": f"{row['ci_lower']:.1f}%~{row['ci_upper']:.1f}%",
+            }
+            for row in conditional_gap_stats["rows"]
+        ]).set_index("미국장 조건")
+        st.dataframe(conditional_table, width="stretch")
+
+    st.subheader("✅ 오늘의 실행안")
+    plan_columns = st.columns(3)
+    plan_columns[0].metric("현재 모델 레벨", f"{level_final}%")
+    plan_columns[1].metric("오버나이트 권장", f"{overnight_plan['level']}%")
+    plan_columns[2].metric("실행 신뢰도", f"{overnight_plan['confidence']}%")
+    if overnight_plan["level"] < level_final:
+        st.warning(overnight_plan["action"])
+    else:
+        st.success(overnight_plan["action"])
+    if overnight_plan["reasons"]:
+        st.write("판단 근거: " + " · ".join(overnight_plan["reasons"]))
+
+    st.subheader("📉 내일 갭 시나리오와 실전 실행 가이드")
+    if overnight_stats["down_probability"] > overnight_stats["up_probability"]:
+        overall_bias = "하락 갭"
+    elif overnight_stats["up_probability"] > overnight_stats["down_probability"]:
+        overall_bias = "상승 갭"
+    else:
+        overall_bias = "방향 우세 없음"
+
+    conditional_row = overnight_plan.get("conditional_row")
+    if conditional_row is not None:
+        condition_text = (
+            f"현재 미국장 조건({conditional_gap_stats['latest_condition']})에서 "
+            f"상승 갭 {conditional_row['up_probability']:.1f}% · "
+            f"하락 갭 {conditional_row['down_probability']:.1f}%"
+        )
+        conditional_bias = (
+            "하락 갭 우세"
+            if conditional_row["down_probability"] > conditional_row["up_probability"]
+            else "상승 갭 우세"
+            if conditional_row["up_probability"] > conditional_row["down_probability"]
+            else "방향 우세 없음"
+        )
+    else:
+        condition_text = "미국장 조건부 표본이 없어 전체 KOSPI 갭 분포만 사용합니다."
+        conditional_bias = "조건부 판단 불가"
+
+    st.write(
+        f"과거 전체 표본에서는 **{overall_bias}**가 우세합니다 "
+        f"(상승 {overnight_stats['up_probability']:.1f}% · "
+        f"하락 {overnight_stats['down_probability']:.1f}%). {condition_text}"
+    )
+    st.write(
+        f"절대 갭 평균은 **{overnight_stats['mean_abs']:.2f}%**, "
+        f"±1% 이상 갭 빈도는 **{overnight_stats['large_gap_probability']:.1f}%**입니다. "
+        "이는 방향 예측 확률이 아니라 과거 관측 빈도이므로, 갭 반대 방향 손실 한도를 먼저 정해야 합니다."
+    )
+
+    if level_final >= 75 and overnight_plan["level"] < level_final:
+        st.warning(
+            f"모델 헤지 레벨은 {level_final}%지만 갭 위험 때문에 권장 보유량은 "
+            f"{overnight_plan['level']}%입니다. 장 마감 전 일부 축소 후, "
+            "개장 갭과 첫 15분 수급을 확인하고 남은 물량을 재조정하는 시나리오입니다."
+        )
+    elif level_final >= 75:
+        st.info(
+            f"모델 헤지 레벨 {level_final}%를 유지할 수 있는 조건이지만, "
+            f"{overnight_stats['mean_abs']:.2f}% 평균 갭을 감내해야 합니다. "
+            "시가 급등 시 추가 손실 한도와 강제 축소 기준을 미리 정하세요."
+        )
+    else:
+        st.info(
+            f"현재 모델 헤지 레벨은 {level_final}%로 강한 방향 베팅이 아닙니다. "
+            "오버나이트보다 개장 후 방향 확인 뒤 재진입하는 보수적 접근이 적합합니다."
+        )
+    st.caption(f"미국장 조건부 방향: {conditional_bias} · 자동 주문은 실행하지 않습니다.")
+    st.caption(
+        "이 실행안은 과거 갭 빈도와 현재 데이터 조건을 결합한 리스크 관리 규칙입니다. "
+        "수익 방향을 보장하지 않으며, 실제 주문 전 상품의 손절·증거금·추적오차를 별도로 확인하세요."
+    )
+
+# ---------------- Swing support/resistance clusters ----------------
+st.divider()
+st.subheader("🧭 실제 반응 기반 스윙 지지·저항 클러스터")
+st.caption(
+    "최근 분석 기간의 국소 스윙 고점·저점을 찾고, 현재 ATR의 0.5배 이상 차이 나는 가격만 "
+    "같은 구간으로 묶었습니다. 최소 2회 반응한 클러스터만 표시합니다."
+)
+st.info(
+    "단위 주의: 스윙 저항선은 지수 가격(포인트), 거래량 비율은 무차원 배수입니다. "
+    "두 값을 나누거나 곱한 가상 가격은 계산하지 않으며, 거래량은 아래 에너지 폭 공식에서만 "
+    "ATR에 곱해 변동 폭을 조정하는 보조 입력으로 사용합니다."
+)
+
+support_rows = [
+    {
+        "구분": "지지",
+        "가격": f"{cluster['level']:,.2f}",
+        "반응 횟수": cluster["reactions"],
+        "최근 반응일": cluster["last_reaction"],
+    }
+    for cluster in swing_levels["support"][:5]
+]
+resistance_rows = [
+    {
+        "구분": "저항",
+        "가격": f"{cluster['level']:,.2f}",
+        "반응 횟수": cluster["reactions"],
+        "최근 반응일": cluster["last_reaction"],
+    }
+    for cluster in swing_levels["resistance"][:5]
+]
+cluster_rows = support_rows + resistance_rows
+if not cluster_rows:
+    st.info("현재가 주변에서 2회 이상 반응한 스윙 지지·저항 클러스터를 찾지 못했습니다.")
+else:
+    st.dataframe(
+        pd.DataFrame(cluster_rows).set_index("구분"),
+        width="stretch",
+    )
+    st.caption(
+        f"현재가: `{spot:,.2f}` · 가격 묶음 허용오차: "
+        f"±{swing_levels['tolerance']:,.2f} · 가까운 지지부터, 가까운 저항부터 표시"
+    )
+
+# ---------------- Rebound exit guide ----------------
+st.divider()
+st.subheader("🎯 반등 목표가와 3단계 분할 청산 가이드")
+st.caption(
+    "가장 가까운 실제 저항 또는 동적 저항을 1차 목표 구간으로 삼습니다. "
+    "목표가는 예측값이 아니라 과거 반응이 확인된 관찰 기준이며, 전량 매도를 강제하지 않습니다."
+)
+
+if rebound_exit is None:
+    st.info("현재가 위에서 확인되는 저항 목표가가 부족해 분할 청산 기준을 계산할 수 없습니다.")
+else:
+    exit_metrics = st.columns(4)
+    exit_metrics[0].metric("1차 목표가", f"{rebound_exit['first_target']:,.2f}")
+    exit_metrics[1].metric("현재가 대비", f"+{rebound_exit['distance_pct']:.2f}%")
+    exit_metrics[2].metric("목표 구간 하단", f"{rebound_exit['target_zone_low']:,.2f}")
+    exit_metrics[3].metric("목표 구간 상단", f"{rebound_exit['target_zone_high']:,.2f}")
+
+    exit_table = pd.DataFrame([
+        {
+            "단계": "1차 청산",
+            "물량": "30%",
+            "실행 기준": f"{rebound_exit['target_zone_low']:,.2f}~{rebound_exit['target_zone_high']:,.2f} 진입",
+            "의미": "첫 저항에서 수익 일부 확정",
+        },
+        {
+            "단계": "2차 관망/청산",
+            "물량": "40%",
+            "실행 기준": "저항 돌파 여부 확인",
+            "의미": "거래량 돌파면 보유, 거부면 순차 청산",
+        },
+        {
+            "단계": "최종 추세 물량",
+            "물량": "30%",
+            "실행 기준": "추세 점수와 지지선 이탈 확인",
+            "의미": "추세가 유지될 때만 가장 늦게 정리",
+        },
+    ]).set_index("단계")
+    st.dataframe(exit_table, width="stretch")
+
+    st.write(
+        f"**1차 목표 근거:** {rebound_exit['target_source']} · "
+        f"현재가 `{spot:,.2f}` → 목표 `{rebound_exit['first_target']:,.2f}`"
+    )
+    if rebound_exit["breakout_confirmed"]:
+        st.success(
+            f"거래량 {vol_ratio_val:.2f}x로 돌파 확인 조건을 충족했습니다. "
+            "1차 30%만 확정하고 잔여 물량은 다음 저항까지 추적하는 시나리오를 검토하세요."
+        )
+    else:
+        volume_text = f"{vol_ratio_val:.2f}x" if not np.isnan(vol_ratio_val) else "N/A"
+        st.warning(
+            f"현재 거래량 {volume_text}는 돌파 확인 기준 {VOLUME_RATIO_STRONG:.1f}x 미만입니다. "
+            "목표 구간에서 30%를 우선 확정하고, 저항 거부 시 2차 물량을 줄이는 보수적 대응을 권장합니다."
+        )
+    if rebound_exit["trend_holds"]:
+        st.info(
+            f"현재 방향 점수 {composite_score:+.1f}로 하방 추세 신호가 남아 있습니다. "
+            "반등 중에는 30%를 먼저 확정하되, 남은 물량은 추세 전환 확인 전까지 단계적으로 관리하세요."
+        )
+    else:
+        st.info(
+            f"현재 방향 점수 {composite_score:+.1f}로 하방 추세 신호가 강하지 않습니다. "
+            "저항 돌파와 지지선 유지가 함께 확인되면 최종 30%를 서둘러 정리하지 않는 시나리오도 가능합니다."
+        )
+
+# ---------------- Rebound scenario validation ----------------
+st.divider()
+st.subheader("🔬 반등 형태와 국면 전개 시나리오 검증")
+st.caption(
+    "과거 '직전 5일 -2% 이하 하락 후 당일 +1% 이상 반등' 사례를 찾아, 이후 5영업일의 실제 결과를 분류했습니다. "
+    "국면 전환은 이후 수익률 +2% 이상, 기술적 반등 실패는 -1% 이하, 나머지는 추세 진행 중입니다."
+)
+
+if rebound_analysis["sample_count"] == 0:
+    st.info("현재 분석 기간에서 비교 가능한 반등 사례가 부족합니다.")
+else:
+    current_setup = rebound_analysis["current"]
+    scenario_metrics = st.columns(4)
+    scenario_metrics[0].metric("당일 반등", f"{current_setup['today_return']:+.2f}%")
+    scenario_metrics[1].metric("직전 5일", f"{current_setup['return_5d']:+.2f}%")
+    scenario_metrics[2].metric("셋업 일치도", f"{current_setup['setup_score']}%")
+    scenario_metrics[3].metric("검증 표본", f"{rebound_analysis['sample_count']}건")
+
+    setup_flags = []
+    setup_flags.append("당일 +1% 이상 반등" if current_setup["is_rebound"] else "당일 반등 조건 미충족")
+    setup_flags.append("지지선 근접" if current_setup["support_touch"] else "지지선 근접 조건 미충족")
+    setup_flags.append("종가가 MA20 상회" if current_setup["ma20"] < spot else "종가가 MA20 하회")
+    st.write("현재 형태: " + " · ".join(setup_flags))
+
+    scenario_table = pd.DataFrame([
+        {
+            "시나리오": row["scenario"],
+            "발생 횟수": f"{row['count']}건",
+            "과거 확률": f"{row['probability']:.1f}%",
+            "95% 신뢰구간": f"{row['lower']:.1f}% ~ {row['upper']:.1f}%",
+        }
+        for row in rebound_analysis["scenarios"]
+    ]).set_index("시나리오")
+    st.dataframe(scenario_table, width="stretch")
+
+    dominant = rebound_analysis["dominant"]
+    st.info(
+        f"가장 빈번했던 결과는 '{dominant['scenario']}'로 "
+        f"{dominant['probability']:.1f}% ({dominant['lower']:.1f}%~{dominant['upper']:.1f}%, 95% CI)입니다. "
+        f"현재 셋업의 과거 비교 표본은 {rebound_analysis['sample_label']} {rebound_analysis['sample_count']}건입니다. "
+        "신뢰구간이 넓으면 표본 부족으로 확률 신뢰도가 낮다는 뜻이며, 모델 신호와 실제 수급이 충돌할 때는 이 구간을 보수적으로 해석해야 합니다."
+    )
 
 # ---------------- Model/market divergence ----------------
 st.divider()
@@ -1080,6 +1960,98 @@ st.write(
     f"ATR14 `{spot_levels['atr']:,.2f}`"
 )
 
+# ---------------- Energy-based dynamic levels ----------------
+st.divider()
+st.subheader("⚡ 시장 에너지 기반 동적 저항·지지선")
+st.caption(
+    "에너지 폭 = ATR14 × 거래량 배수 × (1 - |5일 수익률|)입니다. "
+    "현재 거래 참여량으로 도달 가능한 상단과 하단을 계산한 참고선이며, 확정적인 매물대는 아닙니다."
+)
+st.latex(
+    r"R_{dynamic} = P_{current} + \left(ATR_{14} \times "
+    r"\frac{Volume_{actual}}{Volume_{avg}} \times "
+    r"\left(1 - \frac{|\Delta P_{5d}|}{P_{current}}\right)\right)"
+)
+st.caption(
+    "P_current는 현재 지수, ATR14는 기본 변동성 단위, "
+    "Volume_actual / Volume_avg는 거래량 에너지 배수, "
+    "(1 - |ΔP_5d| / P_current)는 모멘텀 저항 계수입니다. "
+    "거래량 배수는 가격과 직접 나누거나 곱하는 값이 아니라 ATR 폭을 조정하는 무차원 계수입니다."
+)
+
+if energy_level is None:
+    st.info("에너지 레벨 계산에 필요한 일봉 데이터가 부족합니다.")
+else:
+    momentum_pct = energy_level["momentum_return_5d"] * 100
+    momentum_abs_ratio = abs(energy_level["momentum_return_5d"])
+    st.markdown("**현재 데이터 대입**")
+    st.write(
+        f"`R_dynamic = {energy_level['current']:,.2f} + "
+        f"({energy_level['atr14']:,.2f} × {energy_level['volume_ratio']:.2f} × "
+        f"(1 - {momentum_abs_ratio:.4f}))`"
+    )
+    st.write(
+        f"거래량 조정 ATR 폭: `{energy_level['atr14']:,.2f} × "
+        f"{energy_level['volume_ratio']:.2f} = "
+        f"{energy_level['atr14'] * energy_level['volume_ratio']:,.2f}` · "
+        f"모멘텀 저항 계수: `{energy_level['momentum_factor']:.4f}` · "
+        f"5일 수익률: `{momentum_pct:+.2f}%`"
+    )
+    st.write(
+        f"최종 에너지 폭: `{energy_level['energy_width']:,.2f}` · "
+        f"동적 저항선: `{energy_level['dynamic_resistance']:,.2f}` · "
+        f"동적 지지선: `{energy_level['dynamic_support']:,.2f}`"
+    )
+    st.info(
+        "이 동적 저항선은 현재 거래량 에너지로 도달 가능한 단기 경계입니다. "
+        "과거 스윙 저항 클러스터(예: 7,194.07)와 같은 가격대 매물대가 아니며, "
+        "두 수치를 서로 나누거나 곱해 새로운 가격을 만들지 않습니다."
+    )
+    energy_columns = st.columns(5)
+    energy_columns[0].metric("ATR14", f"{energy_level['atr14']:,.2f}")
+    energy_columns[1].metric("거래량 에너지", f"{energy_level['volume_ratio']:.2f}x")
+    energy_columns[2].metric("5일 모멘텀 계수", f"{energy_level['momentum_factor']:.4f}")
+    energy_columns[3].metric("동적 저항선", f"{energy_level['dynamic_resistance']:,.2f}")
+    energy_columns[4].metric("동적 지지선", f"{energy_level['dynamic_support']:,.2f}")
+
+    energy_table = pd.DataFrame([
+        {"구분": "현재가", "값": f"{energy_level['current']:,.2f}", "산출 의미": "계산 기준 종가"},
+        {"구분": "에너지 폭", "값": f"{energy_level['energy_width']:,.2f}", "산출 의미": "현재 참여량으로 가중한 ATR14"},
+        {"구분": "5일 수익률", "값": f"{energy_level['momentum_return_5d'] * 100:+.2f}%", "산출 의미": "모멘텀 저항 계수의 원자료"},
+        {"구분": "거래량 데이터", "값": "실제 거래량" if energy_level["volume_available"] else "거래량 없음 · 1.00x 대체", "산출 의미": "거래량 배수의 신뢰 상태"},
+    ]).set_index("구분")
+    st.dataframe(energy_table, width="stretch")
+
+    if energy_backtest["resistance"] and energy_backtest["support"]:
+        resistance_result = energy_backtest["resistance"]
+        support_result = energy_backtest["support"]
+        validation_table = pd.DataFrame([
+            {
+                "검증 대상": "동적 저항선",
+                "검증 표본": f"{resistance_result['touch_count']}회 터치",
+                "터치 후 거부 확률": f"{resistance_result['hold_probability']:.1f}%",
+                "95% 신뢰구간": f"{resistance_result['ci_lower']:.1f}% ~ {resistance_result['ci_upper']:.1f}%",
+            },
+            {
+                "검증 대상": "동적 지지선",
+                "검증 표본": f"{support_result['touch_count']}회 터치",
+                "터치 후 방어 확률": f"{support_result['hold_probability']:.1f}%",
+                "95% 신뢰구간": f"{support_result['ci_lower']:.1f}% ~ {support_result['ci_upper']:.1f}%",
+            },
+        ]).set_index("검증 대상")
+        st.write(
+            f"**과거 {energy_backtest['horizon']}영업일 검증:** 전체 이벤트 "
+            f"`{energy_backtest['sample_count']}건` · 각 레벨에 실제 도달한 사례만 조건부 집계"
+        )
+        st.dataframe(validation_table, width="stretch")
+        st.caption(
+            "저항 거부는 상단을 터치한 뒤 검증 기간 마지막 종가가 상단 아래인 경우, "
+            "지지 방어는 하단을 터치한 뒤 마지막 종가가 하단 위인 경우입니다. "
+            "신뢰구간이 넓거나 터치 표본이 적으면 해당 레벨의 신뢰도를 낮게 해석하세요."
+        )
+    else:
+        st.info("과거 동적 상·하단 터치 표본이 부족해 신뢰도 검증을 표시할 수 없습니다.")
+
 # ---------------- Standard deviation bands (1σ~6σ) ----------------
 st.divider()
 st.subheader("📐 표준편차 밴드 (1σ ~ 6σ)")
@@ -1170,7 +2142,12 @@ else:
 st.divider()
 st.subheader("📉 GJR-GARCH(1,1,1) 조건부 변동성 모형")
 
-if not ARCH_AVAILABLE:
+if volatility_model_source == "EWMA fallback":
+    st.info(
+        "GJR-GARCH를 사용할 수 없어 EWMA(λ=0.94) 변동성으로 대체했습니다. "
+        f"현재 일간 변동성은 {garch_today_vol_pct:.3f}%이며 Bellman과 밴드 계산에 사용됩니다."
+    )
+elif not ARCH_AVAILABLE:
     st.warning(
         "`arch` 패키지가 설치되어 있지 않습니다. 터미널에서 "
         "`pip install arch` 실행 후 앱을 다시 시작하세요."
@@ -1291,6 +2268,9 @@ forecast_taylor_rows = (
     if tfit is not None else []
 )
 forecast_last_return = float(kospi["Close"].pct_change().iloc[-1])
+taylor_error_multiplier = 1.0
+if tfit is not None and not np.isnan(spot_levels["atr"]) and spot_levels["atr"] > 0:
+    taylor_error_multiplier = float(np.clip(tfit["rmse"] / spot_levels["atr"], 1.0, 3.0))
 dynamic_rows = dynamic_band_forecast(
     spot=spot,
     taylor_rows=forecast_taylor_rows,
@@ -1298,6 +2278,7 @@ dynamic_rows = dynamic_band_forecast(
     atr_value=spot_levels["atr"],
     gamma=forecast_gamma,
     last_return=forecast_last_return,
+    taylor_error_multiplier=taylor_error_multiplier,
 )
 
 if not dynamic_rows:
@@ -1308,6 +2289,10 @@ else:
     d1.metric("최근 일간 수익률", f"{forecast_last_return * 100:+.2f}%")
     d2.metric("비대칭계수 γ", f"{forecast_gamma:+.4f}" if not np.isnan(forecast_gamma) else "N/A")
     d3.metric("충격 상태", shock_label)
+    st.caption(
+        f"변동성 모델: {volatility_model_source} · Taylor RMSE/ATR 오차 확대 배수: "
+        f"{taylor_error_multiplier:.2f}x"
+    )
 
     dynamic_table = pd.DataFrame([
         {
@@ -1348,6 +2333,7 @@ else:
     mu_daily_garch_m = 0.0
 
 mu_daily = mu_daily_score + mu_daily_garch_m
+effective_rebal_cost = rebal_cost * (1.5 if abs(composite_score) < 30 else 1.0)
 
 # 리스크(일간 변동성, 소수) 경로: 확장형 GJR-GARCH 분산을 우선 사용, 없으면 표준편차로 대체
 if garch_res is not None and garch_vol_path_pct is not None and not np.isnan(ext_factor):
@@ -1364,7 +2350,7 @@ v0, optimal_path = bellman_optimal_path(
     sigma_daily_path=sigma_daily_path,
     states=POSITION_STATES,
     risk_aversion=risk_aversion,
-    rebal_cost=rebal_cost,
+    rebal_cost=effective_rebal_cost,
 )
 
 predicted_return_pct = mu_daily * 100
@@ -1377,12 +2363,35 @@ prediction_record = {
     "generated_at": datetime.now().isoformat(timespec="seconds"),
     "data_source": kospi_source,
     "spot_close": float(spot),
+    "direction_score": float(composite_score),
+    "confidence": float(composite_conf),
+    "basis_z": None if np.isnan(basis_z) else float(basis_z),
+    "basis_discount": float(basis_discount),
+    "volatility_model": volatility_model_source,
+    "taylor_error_multiplier": float(taylor_error_multiplier),
+    "regime": regime,
     "predicted_next_close": float(spot * (1.0 + mu_daily)),
     "predicted_return_pct": float(predicted_return_pct),
     "predicted_direction": predicted_direction,
     "current_position": int(level_final),
     "next_position": int(optimal_path[1]),
     "position_path": [int(position) for position in optimal_path],
+    "rebalancing_cost_used": float(effective_rebal_cost),
+    "volume_ratio": None if np.isnan(vol_ratio_val) else float(vol_ratio_val),
+    "volatility_ratio": None if np.isnan(vola_ratio_val) else float(vola_ratio_val),
+    "energy_dynamic_resistance": None if energy_level is None else float(energy_level["dynamic_resistance"]),
+    "energy_dynamic_support": None if energy_level is None else float(energy_level["dynamic_support"]),
+    "energy_width": None if energy_level is None else float(energy_level["energy_width"]),
+    "energy_backtest_samples": int(energy_backtest["sample_count"]),
+    "energy_resistance_hold_probability": (
+        None if not energy_backtest["resistance"] else float(energy_backtest["resistance"]["hold_probability"])
+    ),
+    "energy_support_hold_probability": (
+        None if not energy_backtest["support"] else float(energy_backtest["support"]["hold_probability"])
+    ),
+    "krw_5d_pct": None if np.isnan(krw_5d_pct) else float(krw_5d_pct),
+    "vix": None if np.isnan(vix_last) else float(vix_last),
+    "macro_risk": bool(macro_risk),
 }
 prediction_comparison = log_prediction_and_compare(prediction_record)
 
@@ -1414,6 +2423,33 @@ else:
         f"예측 기준일 {comparison['prediction_date']} → 실제 기준일 {comparison['actual_date']} · "
         f"로그 파일: {PREDICTION_LOG_PATH}"
     )
+
+st.divider()
+st.subheader("📈 신뢰도 추이 및 사후 검증")
+st.caption(
+    "예측 시점의 신뢰도와 이후 실제 방향을 거래일별로 누적합니다. "
+    "기존 로그에 신뢰도가 없으면 빈 값으로 표시되며, 새 실행부터 기록됩니다."
+)
+history_rows = prediction_history_rows(_read_prediction_log(PREDICTION_LOG_PATH))
+if not history_rows:
+    st.info("아직 저장된 예측 이력이 없습니다.")
+else:
+    history_df = pd.DataFrame(history_rows).set_index("예측일")
+    confirmed = history_df[history_df["방향 적중"].isin(["적중", "불일치"])]
+    confidence_values = pd.to_numeric(history_df["신뢰도(%)"], errors="coerce").dropna()
+    h1, h2, h3 = st.columns(3)
+    h1.metric("누적 예측 수", f"{len(history_df)}건")
+    h2.metric(
+        "확인된 방향 적중률",
+        f"{(confirmed['방향 적중'] == '적중').mean() * 100:.1f}%"
+        if not confirmed.empty else "N/A",
+    )
+    h3.metric(
+        "평균 신뢰도",
+        f"{confidence_values.mean():.1f}%"
+        if not confidence_values.empty else "N/A",
+    )
+    st.dataframe(history_df, width="stretch")
 
 bp1, bp2 = st.columns(2)
 bp1.metric("현재 포지션 (t=0)", f"{level_final}%")
