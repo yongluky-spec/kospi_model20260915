@@ -569,6 +569,44 @@ def hybrid_bands(ma_t, daily_vol_ext_price, k1, k2, gamma, neg_shock_indicator, 
     return upper, lower
 
 
+def dynamic_band_forecast(
+    spot,
+    taylor_rows,
+    volatility_path_pct,
+    atr_value,
+    gamma,
+    last_return,
+    horizon=BELLMAN_HORIZON,
+):
+    """테일러 중심값과 GJR-GARCH 변동성으로 h일 동적 밴드를 계산한다."""
+    if volatility_path_pct is None or len(volatility_path_pct) == 0 or np.isnan(spot):
+        return []
+
+    gamma_eff = max(float(gamma), 0.0) if not np.isnan(gamma) else 0.0
+    negative_shock = last_return < 0
+    rows = []
+    for index, volatility_pct in enumerate(volatility_path_pct[:horizon]):
+        taylor_row = taylor_rows[index] if index < len(taylor_rows) else None
+        center = taylor_row["proj"] if taylor_row is not None else spot
+        taylor_error = taylor_row["upper"] - center if taylor_row is not None else 0.0
+        garch_width = spot * float(volatility_pct) / 100.0
+        base_width = max(garch_width, atr_value if not np.isnan(atr_value) else 0.0)
+        lower_multiplier = 1.0 + gamma_eff if negative_shock else 1.0
+        upper = center + base_width + taylor_error
+        lower = center - (base_width * lower_multiplier) - taylor_error
+        rows.append({
+            "h": index + 1,
+            "center": center,
+            "volatility_pct": float(volatility_pct),
+            "upper": upper,
+            "lower": lower,
+            "width": base_width,
+            "taylor_error": taylor_error,
+            "leverage_applied": negative_shock and gamma_eff > 0,
+        })
+    return rows
+
+
 def bellman_optimal_path(
     current_position,
     mu_daily,
@@ -1234,6 +1272,59 @@ else:
         )
     else:
         st.info("확장분산을 계산할 수 없어 하이브리드 밴드를 표시할 수 없습니다.")
+
+# ---------------- Dynamic volatility band forecast ----------------
+st.divider()
+st.subheader("🔭 비대칭 변동성·동적 밴드 전망")
+st.caption(
+    "오늘 종가를 기준으로 테일러 중심 경로와 GJR-GARCH 조건부 변동성 경로를 결합합니다. "
+    "음(-)의 마지막 충격에는 γ를 하단 폭에 추가하고, 양(+)의 반등에는 해당 레버리지 확대를 적용하지 않습니다. "
+    "계산 결과는 확정 예측이 아닌 다음 5영업일의 위험 범위 참고값입니다."
+)
+
+forecast_gamma = np.nan
+if garch_res is not None:
+    forecast_gamma = float(garch_res.params.get("gamma[1]", np.nan))
+
+forecast_taylor_rows = (
+    taylor_projection(tfit, horizons=tuple(range(1, BELLMAN_HORIZON + 1)))
+    if tfit is not None else []
+)
+forecast_last_return = float(kospi["Close"].pct_change().iloc[-1])
+dynamic_rows = dynamic_band_forecast(
+    spot=spot,
+    taylor_rows=forecast_taylor_rows,
+    volatility_path_pct=garch_vol_path_pct,
+    atr_value=spot_levels["atr"],
+    gamma=forecast_gamma,
+    last_return=forecast_last_return,
+)
+
+if not dynamic_rows:
+    st.info("GJR-GARCH 변동성 경로가 없어 동적 밴드 전망을 계산할 수 없습니다.")
+else:
+    shock_label = "하락 충격 · γ 하단 확대" if forecast_last_return < 0 else "상승/반등 · γ 하단 확대 없음"
+    d1, d2, d3 = st.columns(3)
+    d1.metric("최근 일간 수익률", f"{forecast_last_return * 100:+.2f}%")
+    d2.metric("비대칭계수 γ", f"{forecast_gamma:+.4f}" if not np.isnan(forecast_gamma) else "N/A")
+    d3.metric("충격 상태", shock_label)
+
+    dynamic_table = pd.DataFrame([
+        {
+            "시점": f"t+{row['h']}일",
+            "중심값(테일러)": f"{row['center']:,.2f}",
+            "조건부 변동성": f"{row['volatility_pct']:.3f}%",
+            "동적 상단": f"{row['upper']:,.2f}",
+            "동적 하단": f"{row['lower']:,.2f}",
+            "오차폭(RMSE)": f"±{row['taylor_error']:,.2f}",
+        }
+        for row in dynamic_rows
+    ]).set_index("시점")
+    st.dataframe(dynamic_table, width="stretch")
+    st.caption(
+        f"폭 계산 기준: GARCH 일간 변동성 가격폭과 ATR14({spot_levels['atr']:,.2f}) 중 큰 값 + "
+        "테일러 피팅 RMSE 오차폭. 현재 20일 표준편차 밴드는 아래 표에서 별도로 확인합니다."
+    )
 
 # ---------------- Bellman optimal multi-step position path ----------------
 st.divider()
