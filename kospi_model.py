@@ -24,6 +24,8 @@ KOSPI Market Decision Dashboard
 """
 
 import os
+import json
+from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -68,16 +70,127 @@ POSITION_STATES = [0, 25, 50, 75, 100]  # 이산화된 헤지/인버스 포지�
 BELLMAN_HORIZON = 5                      # 몇 영업일 앞까지 다단계로 계획할지
 
 # 야후파이낸스가 한국 지수(특히 ^KS11)를 특정 시점 이후 갱신하지 않는 현상이
-# 실제로 확인되어(2026-09-15), 코스피 종합지수는 KRX 원천(pykrx)을 우선 시도하고
-# 실패 시에만 야후파이낸스로 폴백합니다.
+# 실제로 확인되어(2026-09-15), 코스피 종합지수는 KRX, 네이버, 야후 순으로 시도합니다.
 KRX_INDEX_CODE_MAP = {"^KS11": "1001", "^KS200": "1028"}
 PERIOD_DAYS = {"6mo": 200, "1y": 380, "2y": 760, "5y": 1900}
+NAVER_INDEX_CODE_MAP = {"^KS11": "KOSPI", "^KS200": "KOSPI200"}
+PREDICTION_LOG_PATH = os.environ.get(
+    "KOSPI_PREDICTION_LOG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "prediction_log.jsonl"),
+)
+
+
+def _data_result(df, source, with_source):
+    return (df, source) if with_source else df
+
+
+def _load_naver_index(ticker, period):
+    code = NAVER_INDEX_CODE_MAP[ticker]
+    count = PERIOD_DAYS.get(period, 380)
+    url = (
+        f"https://api.stock.naver.com/chart/domestic/index/{code}"
+        f"?periodType=dayCandle&count={count}"
+    )
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=10) as response:
+        payload = json.load(response)
+
+    rows = payload.get("priceInfos", [])
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows).rename(columns={
+        "localDate": "Date",
+        "openPrice": "Open",
+        "highPrice": "High",
+        "lowPrice": "Low",
+        "closePrice": "Close",
+        "accumulatedTradingVolume": "Volume",
+    })
+    df["Date"] = pd.to_datetime(df["Date"], format="%Y%m%d")
+    return df.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]].apply(
+        pd.to_numeric, errors="coerce"
+    ).dropna()
+
+
+def _read_prediction_log(path):
+    if not os.path.exists(path):
+        return []
+
+    records = []
+    try:
+        with open(path, "r", encoding="utf-8") as log_file:
+            for line in log_file:
+                try:
+                    record = json.loads(line)
+                    if isinstance(record, dict) and record.get("prediction_date"):
+                        records.append(record)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return records
+
+
+def log_prediction_and_compare(record, path=PREDICTION_LOG_PATH):
+    records = _read_prediction_log(path)
+    current_date = record["prediction_date"]
+    previous_records = [
+        item for item in records
+        if item.get("prediction_date", "") < current_date
+    ]
+    comparison = None
+
+    if previous_records:
+        previous = max(previous_records, key=lambda item: item["prediction_date"])
+        previous_close = float(previous["spot_close"])
+        actual_close = float(record["spot_close"])
+        actual_return_pct = (actual_close / previous_close - 1.0) * 100
+        predicted_return_pct = float(previous["predicted_return_pct"])
+        actual_direction = (
+            "상승" if actual_return_pct > 0 else
+            "하락" if actual_return_pct < 0 else "보합"
+        )
+        predicted_direction = previous.get("predicted_direction", "보합")
+        comparison = {
+            "prediction_date": previous["prediction_date"],
+            "actual_date": current_date,
+            "predicted_close": float(previous["predicted_next_close"]),
+            "actual_close": actual_close,
+            "predicted_return_pct": predicted_return_pct,
+            "actual_return_pct": actual_return_pct,
+            "close_error_pct": (actual_close / float(previous["predicted_next_close"]) - 1.0) * 100,
+            "predicted_direction": predicted_direction,
+            "actual_direction": actual_direction,
+            "direction_hit": predicted_direction == actual_direction,
+        }
+
+    # Streamlit rerun이 같은 거래일에 여러 번 발생해도 해당 날짜의 기록은 하나만 유지한다.
+    records = [
+        item for item in records
+        if item.get("prediction_date") != current_date
+    ]
+    records.append(record)
+    records.sort(key=lambda item: item.get("prediction_date", ""))
+
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as log_file:
+            for item in records:
+                log_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+    return comparison
 
 
 @st.cache_data(ttl=300)
-def load_data(ticker: str, period: str = "1y", interval: str = "1d"):
+def load_data(
+    ticker: str, period: str = "1y", interval: str = "1d", with_source: bool = False
+):
     if not ticker:
-        return pd.DataFrame()
+        return _data_result(pd.DataFrame(), None, with_source)
 
     # 코스피/코스피200은 KRX 원천 우선 시도 (야후 지연 문제 우회)
     if PYKRX_AVAILABLE and ticker in KRX_INDEX_CODE_MAP and interval == "1d":
@@ -93,7 +206,19 @@ def load_data(ticker: str, period: str = "1y", interval: str = "1d"):
                     "시가": "Open", "고가": "High", "저가": "Low",
                     "종가": "Close", "거래량": "Volume",
                 })
-                return krx_df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+                return _data_result(
+                    krx_df[["Open", "High", "Low", "Close", "Volume"]].dropna(),
+                    "KRX (pykrx)",
+                    with_source,
+                )
+        except Exception:
+            pass  # 실패 시 아래 야후파이낸스로 폴백
+
+    if ticker in NAVER_INDEX_CODE_MAP and interval == "1d":
+        try:
+            naver_df = _load_naver_index(ticker, period)
+            if not naver_df.empty:
+                return _data_result(naver_df, "Naver Finance", with_source)
         except Exception:
             pass  # 실패 시 아래 야후파이낸스로 폴백
 
@@ -106,19 +231,19 @@ def load_data(ticker: str, period: str = "1y", interval: str = "1d"):
             progress=False,
         )
         if df.empty:
-            return pd.DataFrame()
+            return _data_result(pd.DataFrame(), None, with_source)
 
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
         required = ["Open", "High", "Low", "Close"]
         if not all(c in df.columns for c in required):
-            return pd.DataFrame()
+            return _data_result(pd.DataFrame(), None, with_source)
 
         df = df[required + ([c for c in ["Volume"] if c in df.columns])]
-        return df.dropna()
+        return _data_result(df.dropna(), "Yahoo Finance", with_source)
     except Exception:
-        return pd.DataFrame()
+        return _data_result(pd.DataFrame(), None, with_source)
 
 
 def pct_change(df, n=1):
@@ -589,6 +714,53 @@ def regime_text(score, confidence):
     return "중립"
 
 
+def market_model_divergence(df, score, current_level):
+    """강한 하방 모델 신호와 당일 반등이 충돌할 때 단계적 대응을 제안한다."""
+    if len(df) < 70:
+        return None
+
+    close = df["Close"]
+    today_return = float(close.pct_change().iloc[-1] * 100)
+    return_5d = float(close.pct_change(5).iloc[-1] * 100)
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    volume = volume_ratio(df, n=20)
+
+    strong_rebound = today_return >= 1.0
+    trend_confirmation = close.iloc[-1] > ma20 and return_5d > 0
+    volume_confirmation = not np.isnan(volume) and volume >= 1.2
+
+    if score <= -45 and strong_rebound:
+        if trend_confirmation and volume_confirmation:
+            suggested_level = max(0, current_level - 50)
+            status = "강한 반등 확인"
+            action = "헤지를 50%p까지 단계적으로 축소하고 추세 확인"
+        else:
+            suggested_level = max(0, current_level - 25)
+            status = "반등 발생, 추세 전환 미확인"
+            action = "헤지를 25%p만 축소하고 다음 종가 확인"
+        return {
+            "status": status,
+            "action": action,
+            "suggested_level": suggested_level,
+            "today_return": today_return,
+            "return_5d": return_5d,
+            "volume_ratio": volume,
+            "trend_confirmation": trend_confirmation,
+            "volume_confirmation": volume_confirmation,
+        }
+
+    return {
+        "status": "모델-시장 괴리 없음",
+        "action": "현재 모델 헤지 단계 유지",
+        "suggested_level": current_level,
+        "today_return": today_return,
+        "return_5d": return_5d,
+        "volume_ratio": volume,
+        "trend_confirmation": trend_confirmation,
+        "volume_confirmation": volume_confirmation,
+    }
+
+
 # ---------------- Sidebar ----------------
 st.sidebar.title("⚙️ 데이터 설정")
 
@@ -629,15 +801,17 @@ st.sidebar.caption(
 )
 
 # ---------------- Load ----------------
-kospi = load_data(kospi_ticker, period)
+kospi, kospi_source = load_data(kospi_ticker, period, with_source=True)
 ks200 = load_data(ks200_ticker, period)
 futures = load_data(futures_ticker, period)
 krw = load_data(krw_ticker, period)
 vix = load_data(vix_ticker, period)
 
 st.title("📊 KOSPI Market Decision Engine")
-kospi_source = "KRX (한국거래소, pykrx)" if (PYKRX_AVAILABLE and kospi_ticker in KRX_INDEX_CODE_MAP) else "Yahoo Finance"
-st.caption(f"코스피 종합지수 기준 계산 · KOSPI200/선물은 참고용 표시 · 코스피 데이터 출처: {kospi_source}")
+st.caption(
+    f"코스피 종합지수 기준 계산 · KOSPI200/선물은 참고용 표시 · "
+    f"코스피 데이터 출처: {kospi_source or '없음'} · 기준일: {kospi.index[-1].date() if not kospi.empty else '-'}"
+)
 
 if kospi.empty:
     st.error(
@@ -692,6 +866,9 @@ krw_5d_pct, vix_last, macro_risk, macro_multiplier = macro_gate(krw, vix)
 
 # 매크로 위험 신호(원화 약세 + VIX 급등) 시 최종 진입 강도를 절반으로 낮춘다.
 level_final = round(level * macro_multiplier / 25) * 25
+divergence_guidance = market_model_divergence(
+    kospi, composite_score, level_final
+)
 
 # ---- GJR-GARCH(1,1,1) 조건부 변동성 ----
 garch_res, garch_today_vol_pct, garch_vol_path_pct = fit_gjr_garch(kospi)
@@ -771,6 +948,35 @@ with right:
             st.success("괴리 정상 범위")
     else:
         st.info("선물 데이터를 사용하지 않아 Basis는 계산하지 않습니다. (현물 단독 분석 모드)")
+
+# ---------------- Model/market divergence ----------------
+st.divider()
+st.subheader("🔎 모델-시장 괴리 대응")
+st.caption(
+    "가격·5일 모멘텀·거래량만으로 모델 신호와 당일 시장 움직임의 충돌을 점검합니다. "
+    "외국인·연기금 수급을 직접 사용하지 않으며, 아래 단계는 자동 주문이 아닌 참고안입니다."
+)
+
+if divergence_guidance is not None:
+    dg1, dg2, dg3 = st.columns(3)
+    dg1.metric("당일 수익률", f"{divergence_guidance['today_return']:+.2f}%")
+    dg2.metric("5일 수익률", f"{divergence_guidance['return_5d']:+.2f}%")
+    volume_text = (
+        f"{divergence_guidance['volume_ratio']:.2f}x"
+        if not np.isnan(divergence_guidance["volume_ratio"])
+        else "N/A"
+    )
+    dg3.metric("거래량 비율", volume_text)
+
+    if divergence_guidance["suggested_level"] != level_final:
+        st.warning(
+            f"{divergence_guidance['status']}: {divergence_guidance['action']}. "
+            f"현재 {level_final}% → 참고 단계 {divergence_guidance['suggested_level']}%"
+        )
+    else:
+        st.info(
+            f"{divergence_guidance['status']}: {divergence_guidance['action']}."
+        )
 
 # ---------------- Reliability filters ----------------
 st.divider()
@@ -1069,6 +1275,54 @@ v0, optimal_path = bellman_optimal_path(
     risk_aversion=risk_aversion,
     rebal_cost=rebal_cost,
 )
+
+predicted_return_pct = mu_daily * 100
+predicted_direction = (
+    "상승" if predicted_return_pct > 0 else
+    "하락" if predicted_return_pct < 0 else "보합"
+)
+prediction_record = {
+    "prediction_date": str(kospi.index[-1].date()),
+    "generated_at": datetime.now().isoformat(timespec="seconds"),
+    "data_source": kospi_source,
+    "spot_close": float(spot),
+    "predicted_next_close": float(spot * (1.0 + mu_daily)),
+    "predicted_return_pct": float(predicted_return_pct),
+    "predicted_direction": predicted_direction,
+    "current_position": int(level_final),
+    "next_position": int(optimal_path[1]),
+    "position_path": [int(position) for position in optimal_path],
+}
+prediction_comparison = log_prediction_and_compare(prediction_record)
+
+st.divider()
+st.subheader("📋 어제 예측 vs 오늘 실제")
+if prediction_comparison is None:
+    st.info("비교할 이전 거래일 예측 로그가 없습니다. 오늘 예측을 저장했으며 다음 실행부터 비교합니다.")
+else:
+    comparison = prediction_comparison
+    result_text = "적중" if comparison["direction_hit"] else "불일치"
+    comparison_columns = st.columns(4)
+    comparison_columns[0].metric(
+        "예측 종가",
+        f"{comparison['predicted_close']:,.2f}",
+        f"{comparison['predicted_return_pct']:+.2f}%",
+    )
+    comparison_columns[1].metric(
+        "오늘 실제 종가",
+        f"{comparison['actual_close']:,.2f}",
+        f"{comparison['actual_return_pct']:+.2f}%",
+    )
+    comparison_columns[2].metric("종가 오차", f"{comparison['close_error_pct']:+.2f}%")
+    comparison_columns[3].metric(
+        "방향 적중",
+        result_text,
+        f"예측 {comparison['predicted_direction']} / 실제 {comparison['actual_direction']}",
+    )
+    st.caption(
+        f"예측 기준일 {comparison['prediction_date']} → 실제 기준일 {comparison['actual_date']} · "
+        f"로그 파일: {PREDICTION_LOG_PATH}"
+    )
 
 bp1, bp2 = st.columns(2)
 bp1.metric("현재 포지션 (t=0)", f"{level_final}%")
