@@ -3,11 +3,26 @@
 import json
 import os
 
+import fcntl
+
+
+def _append_record(path, record):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as log_file:
+        fcntl.flock(log_file.fileno(), fcntl.LOCK_EX)
+        try:
+            log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            log_file.flush()
+            os.fsync(log_file.fileno())
+        finally:
+            fcntl.flock(log_file.fileno(), fcntl.LOCK_UN)
+
 
 def read_records(path):
     if not os.path.exists(path):
         return []
-    records = []
+    records_by_date = {}
     try:
         with open(path, "r", encoding="utf-8") as log_file:
             for line in log_file:
@@ -16,43 +31,36 @@ def read_records(path):
                 except json.JSONDecodeError:
                     continue
                 if isinstance(record, dict) and record.get("prediction_date"):
-                    records.append(record)
+                    records_by_date[record["prediction_date"]] = record
     except OSError:
         return []
-    return records
+    return sorted(records_by_date.values(), key=lambda item: item.get("prediction_date", ""))
 
 
 def write_records(path, records):
-    parent = os.path.dirname(os.path.abspath(path))
-    os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as log_file:
-        for record in sorted(records, key=lambda item: item.get("prediction_date", "")):
-            log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    for record in sorted(records, key=lambda item: item.get("prediction_date", "")):
+        _append_record(path, record)
 
 
 def upsert_record(path, record):
-    records = [
-        item for item in read_records(path)
-        if item.get("prediction_date") != record.get("prediction_date")
-    ]
-    records.append(record)
     try:
-        write_records(path, records)
+        _append_record(path, record)
     except OSError:
         pass
-    return records
+    return read_records(path)
 
 
 def update_record(path, prediction_date, updates):
     records = read_records(path)
-    changed = False
-    for record in records:
-        if record.get("prediction_date") == prediction_date:
-            record.update(updates)
-            changed = True
-    if changed:
+    current = next(
+        (record for record in records if record.get("prediction_date") == prediction_date),
+        None,
+    )
+    if current is not None:
+        updated = dict(current)
+        updated.update(updates)
         try:
-            write_records(path, records)
+            _append_record(path, updated)
         except OSError:
             pass
     return records
