@@ -25,6 +25,7 @@ KOSPI Market Decision Dashboard
 
 import os
 import json
+import subprocess
 from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
@@ -84,6 +85,24 @@ MODEL_ADJUSTMENT_PATH = os.environ.get(
     "KOSPI_MODEL_ADJUSTMENTS",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_adjustments.json"),
 )
+
+
+def deployment_revision():
+    """실행 중인 코드의 커밋 식별자를 표시한다."""
+    configured_revision = os.environ.get("GIT_COMMIT", "").strip()
+    if configured_revision:
+        return configured_revision[:12]
+    try:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).strip()
+        return revision or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def _data_result(df, source, with_source):
@@ -1494,7 +1513,8 @@ global_market = load_data(global_ticker, period)
 st.title("📊 KOSPI Market Decision Engine")
 st.caption(
     f"코스피 종합지수 기준 계산 · KOSPI200/선물은 참고용 표시 · "
-    f"코스피 데이터 출처: {kospi_source or '없음'} · 기준일: {kospi.index[-1].date() if not kospi.empty else '-'}"
+    f"코스피 데이터 출처: {kospi_source or '없음'} · 기준일: {kospi.index[-1].date() if not kospi.empty else '-'} · "
+    f"배포 커밋: {deployment_revision()}"
 )
 
 if kospi.empty:
