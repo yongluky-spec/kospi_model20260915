@@ -25,6 +25,7 @@ KOSPI Market Decision Dashboard
 
 import os
 import json
+import math
 import subprocess
 from urllib.request import Request, urlopen
 import numpy as np
@@ -298,6 +299,40 @@ def load_live_quote(ticker):
         return last, pct
     except Exception:
         return np.nan, np.nan
+
+
+def norm_cdf(x):
+    """표준정규분포 누적분포함수 (scipy 의존성 없이 math.erf로 구현)."""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def unhedged_loss_table(mu_daily, sigma_daily_path, spot, z95=1.645):
+    """
+    '만약 헤지 없이 현물을 그대로 매수·보유했다면'을 가정한 h일 기대손실률·VaR 테이블.
+    (나스닥 대시보드의 동일 함수를 그대로 이식 — μ 포함 + 누적 vol path 기반)
+
+    일간 수익률이 매일 독립적으로 N(mu_daily, sigma_t^2)를 따른다는 단순화된
+    정규분포 가정 하에, h일 누적 기대수익률/하락확률/95% VaR를 계산한다.
+    ※ 실제 수익률은 정규분포가 아니고(두꺼운 꼬리), 매일 독립도 아니므로
+    이는 근사적 참고치이지 정밀한 리스크 측정치가 아니다.
+    반환: h별 (기대누적수익률, 누적변동성, 하락확률, 95% VaR) 리스트
+    """
+    rows = []
+    cum_var = 0.0
+    for h, sigma_t in enumerate(sigma_daily_path, start=1):
+        cum_var += sigma_t ** 2
+        sigma_cum = math.sqrt(cum_var)
+        exp_ret = mu_daily * h
+        prob_loss = norm_cdf(-exp_ret / sigma_cum) if sigma_cum > 0 else np.nan
+        var95 = exp_ret - z95 * sigma_cum
+        rows.append({
+            "h": h,
+            "exp_ret": exp_ret,
+            "sigma_cum": sigma_cum,
+            "prob_loss": prob_loss,
+            "var95": var95,
+        })
+    return rows
 
 
 def atr(df, n=14):
@@ -2679,6 +2714,57 @@ v0, optimal_path = bellman_optimal_path(
     rebal_cost=effective_rebal_cost,
 )
 
+# ---------------- v2: (만약) 헤지 없이 현물만 매수·보유했다면 — VaR ----------------
+st.divider()
+st.subheader("📉 (만약) 헤지 없이 현물만 매수·보유했다면 — 기대손실률·VaR")
+st.caption(
+    "나스닥 대시보드와 동일한 로직입니다: μ(기대수익)를 포함하고, 오늘 하루 값에 "
+    "√h만 곱하는 대신 GJR-GARCH가 예측한 h일치 변동성 경로를 그대로 누적합니다. "
+    "정규분포·매일 독립 가정을 쓰므로, 실제 급락(두꺼운 꼬리)은 여기 표시된 값보다 "
+    "더 클 수 있습니다."
+)
+
+loss_rows_95 = unhedged_loss_table(mu_daily, sigma_daily_path, spot, z95=1.645)
+loss_rows_99 = unhedged_loss_table(mu_daily, sigma_daily_path, spot, z95=2.326)
+
+loss_table = pd.DataFrame([
+    {
+        "h (영업일 뒤)": r95["h"],
+        "기대 누적수익률": f"{r95['exp_ret']*100:+.2f}%",
+        "기대 손익(가격)": f"{spot*r95['exp_ret']:+,.1f}",
+        "하락 확률": f"{r95['prob_loss']*100:.1f}%" if not np.isnan(r95["prob_loss"]) else "N/A",
+        "95% VaR": f"{r95['var95']*100:+.2f}%",
+        "99% VaR": f"{r99['var95']*100:+.2f}%",
+    }
+    for r95, r99 in zip(loss_rows_95, loss_rows_99)
+]).set_index("h (영업일 뒤)")
+
+st.dataframe(loss_table, width="stretch")
+
+worst95 = loss_rows_95[-1]
+worst99 = loss_rows_99[-1]
+if worst95["exp_ret"] < 0:
+    st.error(
+        f"헤지 없이 {BELLMAN_HORIZON}영업일 보유 시 기대 누적손실률 "
+        f"**{worst95['exp_ret']*100:+.2f}%**(가격 {spot*worst95['exp_ret']:+,.1f}), "
+        f"손실 확률 **{worst95['prob_loss']*100:.1f}%**, "
+        f"95% VaR **{worst95['var95']*100:+.2f}%**, "
+        f"99% VaR **{worst99['var95']*100:+.2f}%**까지 열려 있습니다. "
+        "이게 바로 위 벨만 모형이 헤지 비중을 높게 권고하는 이유입니다."
+    )
+else:
+    st.success(
+        f"현재 신호는 상승 우세라 헤지 없이 현물만 보유해도 "
+        f"{BELLMAN_HORIZON}영업일 기대수익률이 {worst95['exp_ret']*100:+.2f}%로 양(+)입니다."
+    )
+
+st.caption(
+    "⚠️ 정규분포 가정의 한계: 코스피는 급락 시 실제로 두꺼운 꼬리(fat tail)를 "
+    "보이는 경우가 많아, 이 VaR는 극단적 손실을 과소평가하는 경향이 있습니다. "
+    "참고용 하한선으로만 쓰고, 이 값 이상은 절대 안 잃는다는 보장으로 "
+    "해석하지 마세요."
+)
+
 predicted_return_pct = mu_daily * 100
 predicted_direction = (
     "상승" if predicted_return_pct > 0 else
@@ -2916,6 +3002,10 @@ with st.expander("🔎 상세 분석"):
     rows.update({
         "벨만 t=0 가치함수": v0,
         f"벨만 {BELLMAN_HORIZON}일뒤 권장 포지션": optimal_path[-1],
+        f"무헤지 {BELLMAN_HORIZON}일 기대손실률(%)": worst95["exp_ret"] * 100,
+        f"무헤지 {BELLMAN_HORIZON}일 하락확률(%)": worst95["prob_loss"] * 100 if not np.isnan(worst95["prob_loss"]) else np.nan,
+        f"무헤지 {BELLMAN_HORIZON}일 95%VaR(%)": worst95["var95"] * 100,
+        f"무헤지 {BELLMAN_HORIZON}일 99%VaR(%)": worst99["var95"] * 100,
     })
     st.dataframe(
         pd.DataFrame(rows, index=["값"]).T,
